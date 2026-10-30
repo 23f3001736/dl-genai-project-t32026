@@ -1,0 +1,11 @@
+data/*
+!data/README.md
+!data/.gitkeep
+models/*
+!models/.gitkeep
+wandb/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+submission*.csv
+.DS_Store
