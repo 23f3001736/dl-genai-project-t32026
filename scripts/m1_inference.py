@@ -1,6 +1,6 @@
 """Milestone 1: threshold sweep on the validation split and a test submission.
 
-Usage: python scripts/inference.py --weights models/baseline_tiny_unet.pt --out submission.csv
+Usage: python scripts/m1_inference.py --weights models/baseline_tiny_unet.pt --out submission.csv
 """
 import argparse
 
@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from preprocess import load_wide
-from train import DEVICE, GrayStripDataset, TinyUNet
+from m1_baseline import DEVICE, GrayStripDataset, TinyUNet
 from utils import CLASSES, find_data_root, rle_encode
 
 THRESHOLDS = [0.3, 0.5, 0.7, 0.9]

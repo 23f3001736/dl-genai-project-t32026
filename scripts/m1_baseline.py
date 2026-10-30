@@ -1,6 +1,6 @@
 """Milestone 1 baseline: small U-Net on grayscale strips, BCE + Dice loss, 5 epochs.
 
-Usage: python scripts/train.py --epochs 5 --out models/baseline_tiny_unet.pt
+Usage: python scripts/m1_baseline.py --epochs 5 --out models/baseline_tiny_unet.pt
 (run scripts/preprocess.py first to create data/splits)
 """
 import argparse
