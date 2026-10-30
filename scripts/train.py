@@ -66,7 +66,7 @@ def main():
     parser.add_argument("--splits", default="data/splits")
     parser.add_argument("--out-dir", default="models")
     parser.add_argument("--wandb-project", default="23f3001736-t32026")
-    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-entity", default="23f3001736-indian-institute-of-technology-madras")
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
 
