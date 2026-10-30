@@ -1,72 +1,25 @@
-"""Milestone 1 baseline: small U-Net on grayscale strips, BCE + Dice loss, 5 epochs.
+"""Train one segmentation model and track it with Weights & Biases.
 
-Usage: python scripts/train.py --epochs 5 --out models/baseline_tiny_unet.pt
-(run scripts/preprocess.py first to create data/splits)
+Usage:
+  python scripts/train.py --model scratch_unet --epochs 15 --lr 1e-3
+  python scripts/train.py --model baseline_unet --epochs 5 --loss bce --no-wandb
 """
 import argparse
-import random
+import time
 
-import cv2
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from sklearn.metrics import f1_score
+from torch.utils.data import DataLoader
 
+from dataset import SurfaceAnomalyDataset
+from models import build_model
 from preprocess import load_wide
-from utils import CLASSES, H, W, find_data_root, rle_decode, seed_everything
+from utils import find_data_root, seed_everything
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-class GrayStripDataset(Dataset):
-    def __init__(self, image_ids, wide, image_dir, augment=False):
-        self.ids, self.wide, self.image_dir, self.augment = list(image_ids), wide, image_dir, augment
-
-    def __len__(self):
-        return len(self.ids)
-
-    def __getitem__(self, idx):
-        image_id = self.ids[idx]
-        image = cv2.imread(str(self.image_dir / f"{image_id}.jpg"), cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
-        image = (image - 0.5) / 0.25
-        mask = np.stack([rle_decode(self.wide.loc[image_id, c]) for c in CLASSES]).astype(np.float32)
-        if self.augment and random.random() < 0.5:
-            image, mask = image[:, ::-1], mask[:, :, ::-1]
-        return torch.from_numpy(np.ascontiguousarray(image[None])), torch.from_numpy(np.ascontiguousarray(mask))
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, cin, cout):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(cin, cout, 3, padding=1, bias=False), nn.BatchNorm2d(cout), nn.SiLU(),
-            nn.Conv2d(cout, cout, 3, padding=1, bias=False), nn.BatchNorm2d(cout), nn.SiLU())
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class TinyUNet(nn.Module):
-    def __init__(self, base=8):
-        super().__init__()
-        self.e1, self.e2, self.e3 = ConvBlock(1, base), ConvBlock(base, base * 2), ConvBlock(base * 2, base * 4)
-        self.pool = nn.MaxPool2d(2)
-        self.mid = ConvBlock(base * 4, base * 8)
-        self.u3, self.d3 = nn.ConvTranspose2d(base * 8, base * 4, 2, 2), ConvBlock(base * 8, base * 4)
-        self.u2, self.d2 = nn.ConvTranspose2d(base * 4, base * 2, 2, 2), ConvBlock(base * 4, base * 2)
-        self.u1, self.d1 = nn.ConvTranspose2d(base * 2, base, 2, 2), ConvBlock(base * 2, base)
-        self.out = nn.Conv2d(base, len(CLASSES), 1)
-
-    def forward(self, x):
-        e1 = self.e1(x)
-        e2 = self.e2(self.pool(e1))
-        e3 = self.e3(self.pool(e2))
-        x = self.mid(self.pool(e3))
-        x = self.d3(torch.cat([self.u3(x), e3], 1))
-        x = self.d2(torch.cat([self.u2(x), e2], 1))
-        x = self.d1(torch.cat([self.u1(x), e1], 1))
-        return self.out(x)
 
 
 def bce_dice(logits, target):
@@ -77,36 +30,95 @@ def bce_dice(logits, target):
     return bce + (1 - dice.mean())
 
 
+def evaluate(model, loader, loss_fn):
+    # val loss, Dice on pairs with a defect, accuracy and macro F1 of "is this defect present"
+    model.eval()
+    total, count, inter, pred_px, gt_px = 0.0, 0, [], [], []
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            with torch.amp.autocast("cuda", enabled=DEVICE.type == "cuda"):
+                logits = model(x).float()
+            total += loss_fn(logits, y).item() * x.size(0)
+            count += x.size(0)
+            pred = torch.sigmoid(logits) > 0.5
+            inter.append((pred & (y > 0.5)).sum((2, 3)).cpu())
+            pred_px.append(pred.sum((2, 3)).cpu())
+            gt_px.append(y.sum((2, 3)).cpu())
+    inter, pred_px, gt_px = torch.cat(inter).numpy(), torch.cat(pred_px).numpy(), torch.cat(gt_px).numpy()
+    has_defect, said_defect = gt_px > 0, pred_px > 0
+    dice = 2 * inter / np.maximum(pred_px + gt_px, 1)
+    return {
+        "val_loss": total / count,
+        "val_dice": float(dice[has_defect].mean()),
+        "val_accuracy": float((has_defect == said_defect).mean()),
+        "val_f1": float(np.mean([f1_score(has_defect[:, c], said_defect[:, c], zero_division=0) for c in range(4)])),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--model", default="scratch_unet")
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--loss", choices=["bce", "bce_dice"], default="bce_dice")
     parser.add_argument("--splits", default="data/splits")
-    parser.add_argument("--out", default="models/baseline_tiny_unet.pt")
+    parser.add_argument("--out-dir", default="models")
+    parser.add_argument("--wandb-project", default="23f3001736-t32026")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
 
     seed_everything()
     root = find_data_root()
-    wide = load_wide(root)
-    train_ids = pd.read_csv(f"{args.splits}/train_ids.csv").image_id
-    loader = DataLoader(GrayStripDataset(train_ids, wide, root / "train", augment=True),
-                        batch_size=args.batch_size, shuffle=True, num_workers=2, drop_last=True)
-    model = TinyUNet().to(DEVICE)
+    wide = load_wide(root).reset_index()
+    train_ids = set(pd.read_csv(f"{args.splits}/train_ids.csv").image_id)
+    val_ids = set(pd.read_csv(f"{args.splits}/val_ids.csv").image_id)
+    train_loader = DataLoader(SurfaceAnomalyDataset(wide[wide.image_id.isin(train_ids)], root / "train", augment=True),
+                              batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(SurfaceAnomalyDataset(wide[wide.image_id.isin(val_ids)], root / "train"),
+                            batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    import wandb
+    run = wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.model,
+                     mode="disabled" if args.no_wandb else "online", config=vars(args))
+
+    loss_fn = bce_dice if args.loss == "bce_dice" else nn.BCEWithLogitsLoss()
+    model = build_model(args.model).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.epochs * len(train_loader), pct_start=0.1)
+    scaler = torch.amp.GradScaler("cuda", enabled=DEVICE.type == "cuda")
+    best, history = -1.0, []
+    out_path = f"{args.out_dir}/{args.model}.pt"
     for epoch in range(1, args.epochs + 1):
+        start = time.time()
         model.train()
-        total = 0.0
-        for x, y in loader:
-            x, y = x.to(DEVICE), y.to(DEVICE)
+        running = 0.0
+        for x, y in train_loader:
+            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
             opt.zero_grad(set_to_none=True)
-            loss = bce_dice(model(x), y)
-            loss.backward()
-            opt.step()
-            total += loss.item()
-        print(f"epoch {epoch}/{args.epochs} train_loss={total / len(loader):.5f}")
-    torch.save(model.state_dict(), args.out)
-    print("saved", args.out)
+            with torch.amp.autocast("cuda", enabled=DEVICE.type == "cuda"):
+                loss = loss_fn(model(x), y)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            sched.step()
+            running += loss.item()
+        metrics = {"epoch": epoch, "train_loss": running / len(train_loader), **evaluate(model, val_loader, loss_fn)}
+        history.append(metrics)
+        wandb.log(metrics)
+        print(f"epoch {epoch}: train {metrics['train_loss']:.4f} val {metrics['val_loss']:.4f} "
+              f"dice {metrics['val_dice']:.4f} acc {metrics['val_accuracy']:.4f} f1 {metrics['val_f1']:.4f} "
+              f"({time.time() - start:.0f}s)")
+        if metrics["val_dice"] > best:
+            best = metrics["val_dice"]
+            torch.save(model.state_dict(), out_path)
+    pd.DataFrame(history).to_csv(f"{args.out_dir}/{args.model}_history.csv", index=False)
+    for k, v in max(history, key=lambda h: h["val_dice"]).items():
+        run.summary["best_" + k] = v
+    run.finish()
+    print("best val dice", round(best, 4), "saved", out_path)
 
 
 if __name__ == "__main__":

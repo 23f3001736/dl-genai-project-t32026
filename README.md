@@ -22,13 +22,17 @@ pixel mask per defect type and submit it as run-length encoding (1-based, column
 pip install -r requirements.txt
 ```
 
-## How to run (Milestone 1 baseline)
+## How to run
 
 ```bash
 python scripts/preprocess.py --out data/splits
-python scripts/train.py --epochs 5 --out models/baseline_tiny_unet.pt
-python scripts/inference.py --weights models/baseline_tiny_unet.pt --out submission.csv
+python scripts/eda.py
+wandb login   # once, experiments go to the W&B project 23f3001736-t32026
+python scripts/train.py --model scratch_unet --epochs 15 --lr 1e-3
+python scripts/inference.py --models scratch_unet:models/scratch_unet.pt --out submission.csv
 ```
+
+Milestone 1 grayscale baseline: `python scripts/m1_baseline.py` and `python scripts/m1_inference.py`.
 
 ## Branches
 

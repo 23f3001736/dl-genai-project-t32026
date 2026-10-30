@@ -1,6 +1,7 @@
-"""Milestone 1: threshold sweep on the validation split and a test submission.
+"""Tune thresholds on validation and write the Kaggle submission.
 
-Usage: python scripts/inference.py --weights models/baseline_tiny_unet.pt --out submission.csv
+One or more trained models can be given; their probabilities (with horizontal flip TTA) are averaged.
+Usage: python scripts/inference.py --models scratch_unet:models/scratch_unet.pt --out submission.csv
 """
 import argparse
 
@@ -9,66 +10,91 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
+from dataset import SurfaceAnomalyDataset, TestDataset
+from models import build_model
 from preprocess import load_wide
-from train import DEVICE, GrayStripDataset, TinyUNet
 from utils import CLASSES, find_data_root, rle_encode
 
-THRESHOLDS = [0.3, 0.5, 0.7, 0.9]
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+TAUS = [0.3, 0.4, 0.5, 0.6, 0.7]
+MIN_AREAS = [0, 100, 250, 500, 1000, 1500, 2000, 3000, 4000, 6000]
 
 
-def official_style_score(prob, truth, tau):
-    # 70% Dice on pairs with a defect + 20% false positive pixel score + 10% empty accuracy
-    pred = prob >= tau
-    has_defect = truth.sum(axis=(2, 3)) > 0
-    pred_pos = pred.sum(axis=(2, 3)) > 0
-    inter = (pred & (truth > 0)).sum(axis=(2, 3))
-    denom = pred.sum(axis=(2, 3)) + truth.sum(axis=(2, 3))
-    dice = np.where(denom > 0, 2 * inter / np.maximum(denom, 1), 1.0)
-    fp_score = 1.0 - pred[~has_defect].mean()
-    empty_acc = 1.0 - pred_pos[~has_defect].mean()
-    return 0.7 * dice[has_defect].mean() + 0.2 * fp_score + 0.1 * empty_acc
+def tta_probs(models, x):
+    total = 0
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=DEVICE.type == "cuda"):
+        for m in models:
+            p = torch.sigmoid(m(x)).float()
+            p_flip = torch.sigmoid(m(torch.flip(x, dims=[3]))).float()
+            total = total + (p + torch.flip(p_flip, dims=[3])) / 2
+    return total / len(models)
 
 
-def predict(model, loader):
-    model.eval()
-    probs, truths = [], []
-    with torch.no_grad():
-        for x, y in loader:
-            probs.append(torch.sigmoid(model(x.to(DEVICE))).cpu().numpy().astype(np.float16))
-            truths.append(y.numpy().astype(np.uint8))
-    return np.concatenate(probs), np.concatenate(truths)
+def tune_on_validation(models, loader):
+    # pick a threshold and a minimum mask area per class with the competition style score
+    pred_count, inter_count, gt_count = [], [], []
+    for x, y in loader:
+        x, y = x.to(DEVICE), y.to(DEVICE)
+        p = tta_probs(models, x)
+        pc, ic = [], []
+        for t in TAUS:
+            pm = p >= t
+            pc.append(pm.sum((2, 3)))
+            ic.append((pm & (y > 0.5)).sum((2, 3)))
+        pred_count.append(torch.stack(pc, -1).cpu())
+        inter_count.append(torch.stack(ic, -1).cpu())
+        gt_count.append(y.sum((2, 3)).cpu())
+    pred_count, inter_count, gt_count = (torch.cat(a).numpy() for a in (pred_count, inter_count, gt_count))
+    positive = gt_count > 0
+    n_pos, n_empty = positive.sum(), (~positive).sum()
+    cfg, total = {}, 0.0
+    for c, name in enumerate(CLASSES):
+        options = []
+        for ti, tau in enumerate(TAUS):
+            for area in MIN_AREAS:
+                keep = pred_count[:, c, ti] >= max(area, 1)
+                pos = positive[:, c]
+                dice = np.where(keep, 2 * inter_count[:, c, ti] / np.maximum(pred_count[:, c, ti] + gt_count[:, c], 1), 0.0)
+                options.append((0.7 * dice[pos].sum() / n_pos + 0.3 * (~keep[~pos]).sum() / n_empty, tau, area))
+        cfg[name] = max(options)
+        total += cfg[name][0]
+    return total, cfg
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", default="models/baseline_tiny_unet.pt")
+    parser.add_argument("--models", nargs="+", required=True, help="name:path pairs, e.g. scratch_unet:models/scratch_unet.pt")
     parser.add_argument("--splits", default="data/splits")
     parser.add_argument("--out", default="submission.csv")
     args = parser.parse_args()
 
     root = find_data_root()
-    wide = load_wide(root)
-    model = TinyUNet().to(DEVICE)
-    model.load_state_dict(torch.load(args.weights, map_location=DEVICE))
+    models = []
+    for spec in args.models:
+        name, path = spec.split(":", 1)
+        m = build_model(name, pretrained=False).to(DEVICE)
+        m.load_state_dict(torch.load(path, map_location=DEVICE))
+        m.eval()
+        models.append(m)
 
-    val_ids = pd.read_csv(f"{args.splits}/val_ids.csv").image_id
-    val_loader = DataLoader(GrayStripDataset(val_ids, wide, root / "train"), batch_size=16)
-    prob, truth = predict(model, val_loader)
-    scores = {t: official_style_score(prob, truth, t) for t in THRESHOLDS}
-    for t, s in scores.items():
-        print(f"threshold {t}: official style score {s:.4f}")
-    best = max(scores, key=scores.get)
-    print("best threshold:", best)
+    wide = load_wide(root).reset_index()
+    val_ids = set(pd.read_csv(f"{args.splits}/val_ids.csv").image_id)
+    val_loader = DataLoader(SurfaceAnomalyDataset(wide[wide.image_id.isin(val_ids)], root / "train"), batch_size=16)
+    score, cfg = tune_on_validation(models, val_loader)
+    print(f"tuned validation score {score:.4f}")
+    for name in CLASSES:
+        print(name, "threshold", cfg[name][1], "min_area", cfg[name][2])
 
     sample = pd.read_csv(root / "sample_submission.csv", keep_default_na=False)
     test_ids = sample.image_id.drop_duplicates().tolist()
-    empty = pd.DataFrame("", index=test_ids, columns=CLASSES)
-    test_loader = DataLoader(GrayStripDataset(test_ids, empty, root / "test"), batch_size=16)
-    test_prob, _ = predict(model, test_loader)
     rles = {}
-    for i, image_id in enumerate(test_ids):
-        for c, name in enumerate(CLASSES):
-            rles[(image_id, name)] = rle_encode(test_prob[i, c] >= best)
+    for x, ids in DataLoader(TestDataset(test_ids, root / "test"), batch_size=16):
+        p = tta_probs(models, x.to(DEVICE)).cpu().numpy()
+        for i, image_id in enumerate(ids):
+            for c, name in enumerate(CLASSES):
+                _, tau, area = cfg[name]
+                m = (p[i, c] >= tau).astype(np.uint8)
+                rles[(image_id, name)] = rle_encode(m) if m.sum() >= max(area, 1) else ""
     sample["mask_rle"] = [rles[(i, c)] or " " for i, c in zip(sample.image_id, sample.defect_type)]
     sample.to_csv(args.out, index=False)
     print("saved", args.out)
