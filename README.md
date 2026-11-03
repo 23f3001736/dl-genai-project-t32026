@@ -34,6 +34,8 @@ python scripts/inference.py --models scratch_unet:models/scratch_unet.pt --out s
 
 Milestone 1 grayscale baseline: `python scripts/m1_baseline.py` and `python scripts/m1_inference.py`.
 
+Milestone 4 final model: two EfficientNet-B3 FPN models (`effb3_fpn`) averaged, see `notebooks/milestone-4.ipynb`.
+
 ## Branches
 
 One branch per milestone (`milestone-1`, `milestone-2`, ...), merged into `main` when the milestone is done.
