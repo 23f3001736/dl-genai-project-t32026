@@ -49,7 +49,8 @@ class Normalized(nn.Module):
 
 
 def build_model(name, pretrained=True):
-    """scratch_unet: built from scratch | resnet34_unet: pretrained | effb2_fpn: pretrained, my third model"""
+    """scratch_unet: built from scratch | resnet34_unet: pretrained | effb2_fpn: pretrained, my third model
+    effb3_fpn: bigger EfficientNet used in milestone 4"""
     if name == "scratch_unet":
         return Normalized(UNet3(b=32))
     if name == "baseline_unet":
@@ -60,4 +61,6 @@ def build_model(name, pretrained=True):
         return Normalized(smp.Unet("resnet34", encoder_weights=weights, in_channels=3, classes=4))
     if name == "effb2_fpn":
         return Normalized(smp.FPN("efficientnet-b2", encoder_weights=weights, in_channels=3, classes=4))
+    if name == "effb3_fpn":
+        return Normalized(smp.FPN("efficientnet-b3", encoder_weights=weights, in_channels=3, classes=4))
     raise ValueError(f"unknown model {name}")
