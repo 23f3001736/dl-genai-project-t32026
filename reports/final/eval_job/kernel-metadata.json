@@ -1,0 +1,14 @@
+{
+  "id": "sripathidhruvreddy/dl-23f3001736-final-eval",
+  "title": "DL-23f3001736-final-eval",
+  "code_file": "eval_final.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "competition_sources": ["industrial-surface-defect-detection"],
+  "kernel_sources": ["sripathidhruvreddy/dl-23f3001736-notebook-t32026"],
+  "dataset_sources": [],
+  "model_sources": []
+}

@@ -66,6 +66,8 @@ The project requires three models: one from scratch, one pretrained, and one of 
 | D | FPN, 40 epochs, EMA, oversampling | EfficientNet-B3, ImageNet | 5e-4 | final model 1 |
 | E | same as D, seed 7, BCE weight 8 on `defect_b` | EfficientNet-B3, ImageNet | 5e-4 | final model 2 |
 
+![Final pipeline and model architecture](architecture.png){width=100%}
+
 **Why FPN with EfficientNet.** FPN merges features from several scales. That suits this data, where defects range from tiny spots to long scratches across the strip. EfficientNet gives strong features for few parameters, so I could train at full resolution with batch size 16.
 
 ## 5. Results
@@ -78,7 +80,7 @@ The project requires three models: one from scratch, one pretrained, and one of 
 | B ResNet34 U-Net | 22 | 0.493 | 0.466 | 0.923 | 0.412 |
 | C EffNet-B2 FPN | 23 | 0.410 | **0.530** | **0.943** | **0.570** |
 
-![Milestone 3 model comparison](m3_model_comparison.png){width=80%}
+![Milestone 3 model comparison](m3_model_comparison.png){width=55%}
 
 Pretraining helped a lot. The scratch U-Net learned rough shapes but produced many false alarms on clean images (accuracy 0.58). Model C was best on every metric and was still improving at the end, so I trained it longer in Milestone 4.
 
@@ -94,7 +96,21 @@ Pretraining helped a lot. The scratch U-Net learned rough shapes but produced ma
 
 Every step adds a little: TTA +0.013, model E's `defect_b` weighting +0.017, and the ensemble +0.004. The connected component filter gave no real gain (0.7308 vs 0.7307), so I left it off to keep the pipeline simple.
 
-### 5.3 Leaderboard history
+### 5.3 Final model per class (D + E, validation, 2,279 images)
+
+"Presence" means the image-class pair has a defect. Precision, recall and F1 are for predicting that correctly.
+
+| Class | Positives | Dice (defect pairs) | Precision | Recall | Presence F1 | Missed | False alarms |
+|---|---|---|---|---|---|---|---|
+| defect_a | 216 | 0.402 | 0.733 | 0.634 | 0.680 | 79 | 50 |
+| defect_b | 63 | 0.414 | 0.765 | 0.619 | 0.684 | 24 | 12 |
+| defect_c | 820 | 0.640 | 0.857 | 0.894 | 0.875 | 87 | 122 |
+| defect_d | 342 | 0.746 | 0.868 | 0.906 | 0.887 | 32 | 47 |
+| **Macro** | | **0.551** | | | **0.782** | | |
+
+Overall Dice on defect pairs 0.620, empty accuracy 0.970, score 0.7307. The presence macro F1 went from 0.570 (model C) to **0.782**.
+
+### 5.4 Leaderboard history
 
 | Milestone | Submission | Public LB |
 |---|---|---|
@@ -115,8 +131,13 @@ Every step adds a little: TTA +0.013, model E's `defect_b` weighting +0.017, and
 
 ## 7. Error analysis
 
-- **`defect_b` is the weakest class.** It is rare and its masks are often small. Model D (plain loss) mostly missed it. Model E's higher BCE weight on `defect_b` gave the biggest single gain in the pipeline. In the final test predictions only 108 pairs are predicted as `defect_b`, against 1,139 for `defect_c`.
+- **The rare classes are the weak ones.** `defect_a` (216 positives) and `defect_b` (63) have Dice around 0.40 and miss about 37% of their defects (recall 0.63 and 0.62). The common classes `defect_c` and `defect_d` reach Dice 0.64 to 0.75 and recall about 0.90. Model E's higher BCE weight on `defect_b` gave the biggest single gain in the pipeline (+0.017), but `defect_b` is still under-predicted: only 108 test pairs are predicted as `defect_b`, against 1,139 for `defect_c`.
+- **Most false alarms are `defect_c`** (122 of 231). It is the most common class, so the model is biased towards predicting it on textured surfaces.
 - **Small defects vs false alarms.** A minimum-area filter removes noise, but it also deletes real small defects. At N = 100 pixels, 48 true positive pairs in train would be wiped out completely (22 `defect_a`, 24 `defect_c`). This is why the final thresholds keep the minimum areas small (0 to 100 pixels) instead of large.
+- **Failure examples** (validation, below). (1) A large `defect_c` next to a dark band at the edge of the strip is missed completely. The sharp bright/dark edge seems to hide it. (2) A clean image with long scratch-like stripes is predicted as a huge `defect_c` (41,000 pixels). These stripes look like real defects, so it may also be a labelling edge case. (3) The model finds a `defect_d` blob, but in the wrong place (Dice 0.01).
+
+![Failure examples: input, ground truth, prediction](failure_examples.png){width=100%}
+
 - **Validation vs leaderboard gap.** Validation 0.731 vs public LB 0.670. The main reasons are likely: (a) the thresholds are tuned on my own split, (b) the test set may have a different mix of defects, and (c) the public LB uses only part of the test set. The half-split check shows the tuning itself is stable, so the gap is more about distribution shift than overfitting.
 
 ## 8. Insights and what I would do next
@@ -130,4 +151,5 @@ Every step adds a little: TTA +0.013, model E's `defect_b` weighting +0.017, and
 
 - All code is in the Kaggle notebook (GPU T4, internet on) and in the GitHub repo (`scripts/preprocess.py`, `scripts/train.py`, `scripts/inference.py`, `requirements.txt`).
 - Fixed seeds (`SEED` for model D, 7 for model E). The same split is used for every model.
+- Per-class numbers and failure examples come from `reports/final/eval_job/eval_final.py`, run on Kaggle (GPU) with the saved D and E weights. It reproduces the notebook's validation score of 0.7307 exactly.
 - Every training run is logged to the W&B project `23f3001736-t32026` with its config (model, encoder, epochs, LR, loss, augmentation, seed).
