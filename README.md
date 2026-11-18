@@ -36,6 +36,14 @@ Milestone 1 grayscale baseline: `python scripts/m1_baseline.py` and `python scri
 
 Milestone 4 final model: two EfficientNet-B3 FPN models (`effb3_fpn`) averaged, see `notebooks/milestone-4.ipynb`.
 
+Milestone 5 final pipeline: models D + E with 4-flip TTA, averaged probabilities, per-class threshold and
+minimum area, then RLE. See `notebooks/milestone-5.ipynb` (same as Kaggle notebook
+`DL-23f3001736-notebook-t32026`, version 14). Public leaderboard: 0.66965, validation score: 0.7308.
+
+## Final report
+
+`reports/final/23f3001736_DL_final_report.pdf` (source: `reports/final/report.md`).
+
 ## Branches
 
 One branch per milestone (`milestone-1`, `milestone-2`, ...), merged into `main` when the milestone is done.
