@@ -9,3 +9,6 @@ __pycache__/
 .ipynb_checkpoints/
 submission*.csv
 .DS_Store
+
+# model weights for the HF Space are uploaded to the Space, not to GitHub
+deploy/hf-space/*.pt

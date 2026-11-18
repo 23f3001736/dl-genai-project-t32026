@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SurfaceGuard AI - Defect Segmentation</title>
+<style>
+  :root { --bg:#f7f7f8; --card:#fff; --text:#1d1d1f; --muted:#666; --border:#ddd; --accent:#2563eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width: 900px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 16px; font-size: .95rem; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; margin-bottom:16px; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 16px; font-size:.95rem; cursor:pointer; }
+  button:disabled { background:#9ab; cursor:not-allowed; }
+  canvas { width:100%; height:auto; image-rendering:pixelated; border:1px solid var(--border); border-radius:6px; display:block; }
+  .label { font-size:.85rem; color:var(--muted); margin:10px 0 4px; }
+  table { border-collapse:collapse; width:100%; font-size:.9rem; }
+  th, td { border:1px solid var(--border); padding:6px 8px; text-align:left; }
+  th { background:#f0f0f2; }
+  textarea { width:100%; height:110px; font-family:ui-monospace, Menlo, monospace; font-size:.8rem; border:1px solid var(--border); border-radius:6px; padding:8px; }
+  .sw { display:inline-block; width:12px; height:12px; border-radius:2px; vertical-align:-1px; margin-right:4px; }
+  #status { font-size:.9rem; color:var(--muted); }
+  .legend span { margin-right:14px; font-size:.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>SurfaceGuard AI: Industrial Surface Defect Segmentation</h1>
+  <p class="sub">DL GenAI Project, IITM BS, Term 3 2026, by <b>Sripathi Dhruv Reddy (23f3001736)</b>.
+    Two EfficientNet-B3 FPN models with 4-flip test time augmentation, averaged, then a per-class threshold and
+    minimum area: the same pipeline as the final Kaggle submission (public leaderboard 0.66965).
+    The model runs fully in your browser.</p>
+
+  <div class="card">
+    <div class="row">
+      <input type="file" id="file" accept="image/*">
+      <button id="run" disabled>Detect defects</button>
+      <span id="status">Loading model (about 97 MB, first time only)...</span>
+    </div>
+    <div class="label">Input (resized to 800 x 128 if needed)</div>
+    <canvas id="input" width="800" height="128"></canvas>
+    <div class="label">Predicted defects</div>
+    <canvas id="output" width="800" height="128"></canvas>
+    <div class="legend" id="legend" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead><tr><th>Defect</th><th>Found</th><th>Area (pixels)</th><th>Max probability</th><th>Threshold / min area</th></tr></thead>
+      <tbody id="table"><tr><td colspan="5" style="color:#888">Upload an image and press "Detect defects".</td></tr></tbody>
+    </table>
+    <div class="label">Run-length encoding (competition format: 1-based, column-major)</div>
+    <textarea id="rle" readonly></textarea>
+  </div>
+
+  <p class="sub">Code: GitHub <code>23f3001736/dl-genai-project-t32026</code>.
+    Model: <a href="https://huggingface.co/23f3001736/surfaceguard-defect-segmentation">23f3001736/surfaceguard-defect-segmentation</a>.</p>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<script>
+const H = 128, W = 800;
+const MODEL_URL = "https://huggingface.co/23f3001736/surfaceguard-defect-segmentation/resolve/main/surfaceguard_ensemble.onnx";
+const CLASSES = ["defect_a", "defect_b", "defect_c", "defect_d"];
+// [threshold, min area] per class, tuned on the validation split in the notebook
+const CFG = { defect_a: [0.2, 0], defect_b: [0.2, 100], defect_c: [0.2, 50], defect_d: [0.2, 0] };
+const COLOURS = { defect_a: [255, 60, 60], defect_b: [60, 200, 255], defect_c: [255, 200, 0], defect_d: [180, 80, 255] };
+
+const $ = id => document.getElementById(id);
+const inCtx = $("input").getContext("2d"), outCtx = $("output").getContext("2d");
+let session = null, haveImage = false;
+
+$("legend").innerHTML = CLASSES.map(c => `<span><i class="sw" style="background:rgb(${COLOURS[c]})"></i>${c}</span>`).join("");
+
+function ready() { $("run").disabled = !(session && haveImage); }
+
+(async () => {
+  try {
+    ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 1);
+    session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ["wasm"] });
+    $("status").textContent = "Model ready.";
+  } catch (e) {
+    $("status").textContent = "Could not load the model: " + e.message;
+  }
+  ready();
+})();
+
+$("file").addEventListener("change", e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const img = new Image();
+  img.onload = () => {
+    inCtx.drawImage(img, 0, 0, W, H);
+    outCtx.clearRect(0, 0, W, H);
+    haveImage = true;
+    $("status").textContent = session ? "Image loaded." : $("status").textContent;
+    ready();
+  };
+  img.src = URL.createObjectURL(f);
+});
+
+// competition RLE: 1-based starts, column-major (Fortran) order
+function rleEncode(mask) {
+  const runs = [];
+  let prev = 0, start = 0, idx = 0;
+  for (let x = 0; x < W; x++) {
+    for (let y = 0; y < H; y++) {
+      idx++;
+      const v = mask[y * W + x];
+      if (v && !prev) start = idx;
+      if (!v && prev) runs.push(start, idx - start);
+      prev = v;
+    }
+  }
+  if (prev) runs.push(start, idx + 1 - start);
+  return runs.join(" ");
+}
+
+$("run").addEventListener("click", async () => {
+  $("run").disabled = true;
+  $("status").textContent = "Running (2 models x 4 flips)...";
+  await new Promise(r => setTimeout(r, 20));
+  const t0 = performance.now();
+  const px = inCtx.getImageData(0, 0, W, H).data;
+  // RGB in [0, 1], shape (1, 3, H, W); ImageNet normalisation is inside the model
+  const x = new Float32Array(3 * H * W);
+  for (let i = 0; i < H * W; i++) {
+    x[i] = px[i * 4] / 255; x[H * W + i] = px[i * 4 + 1] / 255; x[2 * H * W + i] = px[i * 4 + 2] / 255;
+  }
+  const out = await session.run({ image: new ort.Tensor("float32", x, [1, 3, H, W]) });
+  const prob = out.prob.data;
+
+  const overlay = outCtx.createImageData(W, H);
+  for (let i = 0; i < H * W; i++) {
+    overlay.data[i * 4] = px[i * 4]; overlay.data[i * 4 + 1] = px[i * 4 + 1];
+    overlay.data[i * 4 + 2] = px[i * 4 + 2]; overlay.data[i * 4 + 3] = 255;
+  }
+  const rows = [], rles = [];
+  CLASSES.forEach((name, c) => {
+    const [tau, minArea] = CFG[name];
+    const mask = new Uint8Array(H * W);
+    let area = 0, pmax = 0;
+    for (let i = 0; i < H * W; i++) {
+      const p = prob[c * H * W + i];
+      if (p > pmax) pmax = p;
+      if (p >= tau) { mask[i] = 1; area++; }
+    }
+    // drop the whole mask if it is smaller than the tuned minimum area
+    const found = area >= Math.max(minArea, 1);
+    if (found) {
+      const col = COLOURS[name];
+      for (let i = 0; i < H * W; i++) if (mask[i]) for (let k = 0; k < 3; k++)
+        overlay.data[i * 4 + k] = 0.45 * overlay.data[i * 4 + k] + 0.55 * col[k];
+    }
+    rows.push(`<tr><td><i class="sw" style="background:rgb(${COLOURS[name]})"></i>${name}</td><td>${found ? "yes" : "no"}</td>` +
+              `<td>${found ? area : 0}</td><td>${pmax.toFixed(3)}</td><td>${tau} / ${minArea}</td></tr>`);
+    rles.push(`${name}: ${found ? rleEncode(mask) : "(empty)"}`);
+  });
+  outCtx.putImageData(overlay, 0, 0);
+  $("table").innerHTML = rows.join("");
+  $("rle").value = rles.join("\n");
+  $("status").textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(1)} s.`;
+  ready();
+});
+</script>
+</body>
+</html>
