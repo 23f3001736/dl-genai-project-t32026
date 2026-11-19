@@ -1,155 +1,143 @@
 ---
 title: "SurfaceGuard AI: Industrial Surface Defect Segmentation"
-subtitle: "DL GenAI Project, Term 3 2026 - Final Report"
+subtitle: "DL GenAI Project (BSDA2001P), Term 3 2026 - Final Report"
 author: "Sripathi Dhruv Reddy (23f3001736)"
 ---
 
-**Kaggle notebook:** `DL-23f3001736-notebook-t32026` (version 14) | **W&B project:** `23f3001736-t32026` | **GitHub:** `23f3001736/dl-genai-project-t32026`
+**Kaggle notebook:** `DL-23f3001736-notebook-t32026` (v14) | **W&B:** `23f3001736-t32026` | **GitHub:** `23f3001736/dl-genai-project-t32026` | **Demo:** huggingface.co/spaces/23f3001736/surfaceguard-defect-segmentation
 
-**Final result:** public leaderboard **0.66965** (cutoff 0.65), validation score 0.7308.
+## 1. Abstract
 
-## 1. Problem statement
+The SurfaceGuard AI competition asks for a pixel mask of four defect types (`defect_a` to `defect_d`) on 128 x 800 grayscale surface strips, scored by an official metric of 70% Dice on defect pairs, 20% false-positive pixels and 10% empty accuracy. I built a combination-stratified 80/20 split and compared three model types: a **U-Net built from scratch**, a **pretrained ResNet34 U-Net**, and my choice, an **FPN with a pretrained EfficientNet** encoder. All were trained with BCE + Dice, AdamW, OneCycle, mixed precision and logged to W&B. The best design was trained longer as two EfficientNet-B3 FPN models (D and E), averaged with 4-flip test-time augmentation and per-class threshold and minimum-area post-processing. The final pipeline scores **0.7307 on validation** (presence macro F1 0.782) and **0.66965 on the public leaderboard** (cutoff 0.65, rank 565 of 1,409). Main learnings: pretrained encoders gave the largest gain, and post-processing tuned with the official metric matters almost as much as the model.
 
-Each image is a grayscale strip of an industrial surface, 128 x 800 pixels. It can contain any mix of four defect types (`defect_a` to `defect_d`). For every (image, defect type) pair the model must predict a pixel mask, written as run-length encoding (1-based starts, column-major order). An empty mask is written as a single space.
+## 2. Introduction
 
-The official metric combines three parts:
+**Problem statement.** Each training image has four (image, defect type) rows with a run-length-encoded mask (1-based, column-major); an empty mask is a single space. For the 3,000 test images I must predict all four masks. One image can contain several defect types, so this is **multi-label semantic segmentation**.
 
-- **70%** Dice, only on pairs that really have a defect
-- **20%** false positive score: how few pixels are predicted on pairs that should be empty
-- **10%** empty accuracy: how often an empty pair is predicted as empty
+**Project objectives.** (1) Cross the 0.65 cutoff with a trained model; (2) build and compare at least three model types (scratch, pretrained, own choice) with W&B tracking; (3) handle class imbalance and tune post-processing on the official metric; (4) deploy the final model.
 
-So the task is a **multi-label segmentation** problem, where predicting "nothing" correctly matters almost as much as drawing good masks.
+**Report structure.** Section 3 covers the data, Section 4 the input representation, Section 5 the three model types, Section 6 the results and comparison, Section 7 the conclusions and Section 8 the references.
 
-## 2. Data
+## 3. Dataset & preprocessing
 
-| Item | Value |
+**Dataset.** 11,393 training images (45,572 image-class rows) and 3,000 test images, each 128 x 800 pixels, grayscale stored as 3-channel JPEG.
+
+**EDA (Milestones 1 and 2).**
+
+| Statistic | Value |
 |---|---|
-| Training images | 11,393 (45,572 image-class rows) |
-| Test images | 3,000 (12,000 rows) |
-| Clean images (no defect) | 5,516 (about 48%) |
-| Images with more than one defect | 1,198 |
-| Image size | 128 x 800, grayscale (stored as 3-channel) |
+| Clean images (no defect) | 5,516 (48%) |
+| Images with more than one defect type | 1,198 |
+| Validation positives per class (of 2,279 images) | a 216, b 63, c 820, d 342 |
 
-Main points from the EDA (Milestones 1 and 2):
+- **Strong class imbalance:** `defect_c` is common, `defect_b` is very rare and often small.
+- **Co-occurrence:** the co-occurrence matrix C = X^T X and the phi coefficient show that some defects appear together, but their pixel overlap is small. This supports one sigmoid output per class.
+- **Aspect ratio 6.25 : 1:** resizing to a square would squash thin defects, so I train at native resolution.
+- **Naive Dice trap:** a mean Dice that counts empty pairs as 1 prefers threshold 0.9, but the official metric prefers 0.3. All tuning uses the official-style score.
 
-- **Strong class imbalance.** `defect_c` is the most common, `defect_b` is very rare. Many `defect_b` masks are also small, so a model can ignore it and still get a decent loss.
-- **Co-occurrence.** I computed the co-occurrence matrix C = X^T X and the phi coefficient. Some defects appear together, but the pixel overlap between classes is small. This is why I used **sigmoid outputs (multi-label)** rather than softmax: one pixel or one image can belong to more than one class.
-- **Aspect ratio.** The images are 6.25 times wider than they are tall. I trained at native resolution (128 x 800), so the thin defects are not distorted or shrunk.
-- **Naive Dice trap.** A naive mean Dice that counts empty pairs as Dice 1 prefers a high threshold (0.9), but the official metric prefers 0.3. So all tuning was done with the official-style score.
+**Preprocessing.** RLE decode to a 4 x 128 x 800 mask; images scaled to [0, 1]. **Split:** 80/20, stratified on the combination string of defects in each image (e.g. `0101`), seed 1736; combinations with one image go to train. **Imbalance:** images with `defect_a` are sampled 2x and with `defect_b` 3x (Milestone 4).
 
-**Split.** An 80/20 split, stratified on the *combination string* of defects in each image (for example `a+c`). This keeps the rare combinations in both train and validation. Combinations with only one image go to train.
+**Data augmentation.** Horizontal and vertical flips (defects have no fixed orientation), and from Milestone 4 small brightness (+/-0.08) and contrast (+/-15%) changes, done on the GPU. These keep the labels valid and make the model robust to lighting differences between strips.
 
-## 3. Methodology and pipeline
+## 4. Input representation (adapted from "Tokenization strategy")
 
-```
-image -> model(s) with 4-flip TTA -> average probabilities
-      -> per-class threshold -> per-class minimum area filter -> RLE -> submission.csv
-```
+This project uses images, not text, so there is no tokenizer. The equivalent step is turning a strip into a tensor the network can read:
 
-- **Input:** RGB image scaled to [0, 1], then ImageNet normalisation inside the model (a `Normalized` wrapper), so pretrained encoders get the input they expect.
-- **Augmentation:** horizontal and vertical flips. From Milestone 4 also small brightness and contrast changes (done on the GPU).
-- **Loss:** BCE + soft Dice. BCE gives stable per-pixel gradients. Dice directly targets overlap and is less affected by the many background pixels. Model E also uses `pos_weight = 8` on `defect_b` in the BCE to push recall on the rarest class.
-- **Optimizer:** AdamW (weight decay 1e-4) with a OneCycle learning rate schedule (10% warmup, then cosine decay), stepped every batch.
-- **Mixed precision** (AMP) on a Kaggle T4 GPU, which roughly halves activation memory.
-- **Rare-class oversampling:** images with `defect_a` are drawn 2x as often, and images with `defect_b` 3x as often.
-- **EMA** of the weights during training, used for validation and saving.
+- **Pixels to tensor:** each image becomes a float tensor 3 x 128 x 800 in [0, 1]. The grayscale channel is repeated 3 times so ImageNet-pretrained encoders can be used unchanged.
+- **Normalisation inside the model:** a small `Normalized` wrapper subtracts the ImageNet mean and divides by the std, so training, validation, test and the deployed demo all get the same input.
+- **No resizing or patching:** 128 and 800 are divisible by 32, so encoders with 5 down-sampling steps work at full resolution.
+- **Efficient pipeline:** from Milestone 4 the whole training split is kept in memory as uint8 (2 GB instead of 8 GB in float32), and augmentation runs on the GPU, which made epochs faster.
+- **Alternatives tried:** a single-channel grayscale input for the Milestone 1 baseline. The 3-channel RGB input was kept because it lets pretrained weights load directly.
 
-## 4. Models
+## 5. Modeling & experimentation
 
-The project requires three models: one from scratch, one pretrained, and one of my choice. All three were trained on the same split with the same loss and metrics, and logged to W&B.
+All models output **4 logits per pixel with a sigmoid** (multi-label), and use the loss **BCE + soft Dice**: BCE gives stable per-pixel gradients and Dice targets overlap directly, so the many background pixels do not dominate. Common setup: AdamW (weight decay 1e-4), OneCycle LR (10% warmup then cosine decay, stepped every batch), batch 16, mixed precision (AMP), flips, one W&B run per model.
 
-| Model | Architecture | Encoder | LR | Role |
-|---|---|---|---|---|
-| A | 3-stage U-Net (base width 32) | none, random init | 1e-3 | built from scratch |
-| B | U-Net (smp) | ResNet34, ImageNet | 3e-4 | pretrained |
-| C | FPN (smp) | EfficientNet-B2, ImageNet | 3e-4 | my choice |
-| D | FPN, 40 epochs, EMA, oversampling | EfficientNet-B3, ImageNet | 5e-4 | final model 1 |
-| E | same as D, seed 7, BCE weight 8 on `defect_b` | EfficientNet-B3, ImageNet | 5e-4 | final model 2 |
+### 5.1 Model 1: fine-tuned pretrained encoder-decoder (models B, C, D, E)
 
-![Final pipeline and model architecture](architecture.png){width=100%}
+**Architecture.** B is a U-Net decoder with an ImageNet **ResNet34** encoder [He et al., 2016] (residual blocks, 24.4 M parameters). C, D and E use a **Feature Pyramid Network** decoder [Lin et al., 2017] on **EfficientNet-B2/B3** encoders [Tan & Le, 2019] (9.5 M and 12.5 M parameters), implemented with `segmentation_models_pytorch` [Iakubovskii, 2019].
 
-**Why FPN with EfficientNet.** FPN merges features from several scales. That suits this data, where defects range from tiny spots to long scratches across the strip. EfficientNet gives strong features for few parameters, so I could train at full resolution with batch size 16.
+**Salient points.** Residual and MBConv blocks give strong low-level texture features learned on ImageNet. FPN merges features from several scales, which suits defects ranging from tiny spots to long scratches. EfficientNet gives more accuracy per parameter than ResNet34.
 
-## 5. Results
+**Fine-tuning strategy.** No layers were frozen: the whole network was fine-tuned, because industrial surface textures differ from ImageNet photos. Pretrained models used a lower LR (3e-4 for B and C, 5e-4 for D and E) than the scratch model (1e-3) to avoid destroying the pretrained features. B and C trained 25 epochs, keeping the best epoch by val Dice. D and E trained **40 epochs** with rare-class oversampling and an **EMA** of the weights; E also uses BCE `pos_weight = 8` on `defect_b`. No quantization was used for training; for the demo the D + E ensemble with TTA was exported to one **ONNX** graph (97 MB) that runs in the browser.
 
-### 5.1 Three-model comparison (Milestone 3, best epoch, same validation split)
+![Final pipeline: models D and E with 4-flip TTA and per-class post-processing](architecture.png){width=92%}
 
-| Model | Best epoch | Val loss | Val Dice (defect pairs) | Presence accuracy | Presence macro F1 |
+### 5.2 Model 2: custom deep learning model (model A, built from scratch)
+
+**Architecture.** A 3-stage U-Net [Ronneberger et al., 2015] written from scratch in PyTorch, base width 32, **1.93 M parameters**, random initialisation.
+
+![Model A: 3-stage U-Net built from scratch](unet_scratch.png){width=88%}
+
+**Salient points.** The encoder halves the resolution three times to see wider context; the decoder up-samples back to full size, and **skip connections** copy the encoder features across so fine defect edges are not lost. BatchNorm keeps training stable without pretrained weights. Three stages (not four or five) keep the model small enough to train at full 128 x 800 resolution with batch 16.
+
+### 5.3 Model 3: my choice (adapted from "RNN-based model")
+
+An RNN is designed for sequences such as text and is not a natural fit for 2-D image masks, and my project guideline asks for a third model "of your choice". My choice is the **FPN with an EfficientNet encoder** (model C, later D and E, described in 5.1). I chose it over a second U-Net because the FPN decoder adds multi-scale features, which the error analysis showed matters for the mix of tiny and large defects. It was the best of the three in Milestone 3 and became the final model.
+
+## 6. Performance & comparative analysis
+
+**Metrics.** *Official score* = 0.7 x mean Dice on pairs that have a defect + 0.2 x (1 - false-positive pixel fraction on empty pairs) + 0.1 x empty accuracy. I also report *presence* accuracy, precision, recall and macro F1 for "does this (image, class) pair contain the defect".
+
+**Training performance (curves from my W&B project).**
+
+![Training curves from W&B: Milestone 3 loss and Dice/F1, and Milestone 4 official-style score](wandb_curves.png){width=100%}
+
+The scratch U-Net's train and val loss stay close but high (underfitting). The pretrained models drop much lower. C reaches the best val Dice and F1 and was still improving at epoch 25, so D and E were trained for 40 epochs; E (BCE weight on `defect_b`) ends above D.
+
+**Comparative report (same validation split).**
+
+| Model | Params | Epochs, time per epoch (T4) | Val Dice (defect pairs) | Presence accuracy | Presence macro F1 |
 |---|---|---|---|---|---|
-| A scratch U-Net | 11 | 0.783 | 0.434 | 0.581 | 0.354 |
-| B ResNet34 U-Net | 22 | 0.493 | 0.466 | 0.923 | 0.412 |
-| C EffNet-B2 FPN | 23 | 0.410 | **0.530** | **0.943** | **0.570** |
+| A scratch U-Net | 1.9 M | 15, ~165 s | 0.434 | 0.581 | 0.354 |
+| B ResNet34 U-Net | 24.4 M | 25, ~125 s | 0.466 | 0.923 | 0.412 |
+| C EffNet-B2 FPN | 9.5 M | 25, ~120 s | 0.530 | 0.943 | 0.570 |
+| **D + E EffNet-B3 FPN, 4-flip TTA** | 2 x 12.5 M | 40 each, ~165 s | **0.620** | | **0.782** |
 
-![Milestone 3 model comparison](m3_model_comparison.png){width=55%}
+**Trade-offs.** B has the most parameters but is beaten by the smaller C, so encoder quality matters more than size. D + E with TTA is the most accurate but costs 2 models x 4 views = 8 forward passes per image at inference; on CPU this is about 3 s per image, still fine for the demo.
 
-Pretraining helped a lot. The scratch U-Net learned rough shapes but produced many false alarms on clean images (accuracy 0.58). Model C was best on every metric and was still improving at the end, so I trained it longer in Milestone 4.
+**What each step of the final pipeline adds (validation, official score).**
 
-### 5.2 Final pipeline: what each step adds (validation, official-style score)
+| Step | Score |
+|---|---|
+| D, no TTA | 0.6971 |
+| D, 4-flip TTA | 0.7097 |
+| E, 4-flip TTA | 0.7263 |
+| **D + E, 4-flip TTA (final)** | **0.7307** |
 
-| Step | Dice (defect pairs) | Empty accuracy | FP pixel fraction | Score |
-|---|---|---|---|---|
-| D, no TTA | 0.5702 | 0.9799 | 0.0004 | 0.6971 |
-| D, 4-flip TTA | 0.5900 | 0.9683 | 0.0006 | 0.7097 |
-| E, 4-flip TTA | 0.6136 | 0.9685 | 0.0005 | 0.7263 |
-| **D + E, 4-flip TTA** | **0.6198** | 0.9699 | 0.0006 | **0.7307** |
-| + connected component filter | | | | 0.7308 |
+Tuning check: thresholds tuned on half of the validation images and scored on the other half give 0.7303 and 0.7289, so the tuning is not overfitted.
 
-Every step adds a little: TTA +0.013, model E's `defect_b` weighting +0.017, and the ensemble +0.004. The connected component filter gave no real gain (0.7308 vs 0.7307), so I left it off to keep the pipeline simple.
+**Final model per class (D + E, validation).**
 
-### 5.3 Final model per class (D + E, validation, 2,279 images)
+| Class | Positives | Dice | Precision | Recall | Presence F1 |
+|---|---|---|---|---|---|
+| defect_a | 216 | 0.402 | 0.733 | 0.634 | 0.680 |
+| defect_b | 63 | 0.414 | 0.765 | 0.619 | 0.684 |
+| defect_c | 820 | 0.640 | 0.857 | 0.894 | 0.875 |
+| defect_d | 342 | 0.746 | 0.868 | 0.906 | 0.887 |
 
-"Presence" means the image-class pair has a defect. Precision, recall and F1 are for predicting that correctly.
+**Error analysis.** The rare classes `defect_a` and `defect_b` miss about 37% of their defects. Most false alarms are `defect_c` (122 of 231), the most common class. Typical failures (below): a large defect next to a dark band at the strip edge is missed; a clean strip with long scratch-like stripes is predicted as a large `defect_c`; a `defect_d` is found in the wrong place.
 
-| Class | Positives | Dice (defect pairs) | Precision | Recall | Presence F1 | Missed | False alarms |
-|---|---|---|---|---|---|---|---|
-| defect_a | 216 | 0.402 | 0.733 | 0.634 | 0.680 | 79 | 50 |
-| defect_b | 63 | 0.414 | 0.765 | 0.619 | 0.684 | 24 | 12 |
-| defect_c | 820 | 0.640 | 0.857 | 0.894 | 0.875 | 87 | 122 |
-| defect_d | 342 | 0.746 | 0.868 | 0.906 | 0.887 | 32 | 47 |
-| **Macro** | | **0.551** | | | **0.782** | | |
+![Failure examples on validation: input, ground truth, prediction](failure_examples.png){width=82%}
 
-Overall Dice on defect pairs 0.620, empty accuracy 0.970, score 0.7307. The presence macro F1 went from 0.570 (model C) to **0.782**.
+**Kaggle performance.** Final public leaderboard score **0.66965**, rank **565 of 1,409** (cutoff 0.65). Leaderboard history: M1 0.373, M2 0.575, M3 0.615, M4 0.665, M5 0.670.
 
-### 5.4 Leaderboard history
+## 7. Conclusion & future work
 
-| Milestone | Submission | Public LB |
-|---|---|---|
-| Registration | dummy baseline | 0.000 |
-| M1 | basic U-Net baseline | 0.373 |
-| M2 | ResNet34 U-Net, BCE+Dice, tuned threshold and area | 0.575 |
-| M3 | EfficientNet-B2 FPN | 0.615 |
-| M4 | ensemble of two EfficientNet-B3 FPNs | 0.665 |
-| **M5** | **D + E, 4-flip TTA, tuned per-class thresholds** | **0.670** |
+**Key learnings.** (1) Pretrained encoders gave the biggest jump; the scratch U-Net underfits. (2) Because 30% of the metric is about empty pairs, per-class thresholds and minimum areas move the score as much as a better model. (3) Use the official metric for every decision; the naive Dice would have chosen the wrong threshold. (4) Clean tooling (one split, W&B runs, milestone branches) made comparisons fair.
 
-## 6. Training details and experiments
+**Challenges.** *Class imbalance*: solved partly with oversampling and a BCE weight on `defect_b`. *GPU time and memory*: uint8 in-memory data, GPU augmentation and AMP. *Validation vs leaderboard gap* (0.731 vs 0.670): on test the model predicts `defect_d` on 31% of images against 16% on validation. A confidence filter and a third ensemble model (F, another seed) both lowered the validation score (0.7225 and 0.7279), so the gap looks like a real test distribution shift rather than false alarms, and I kept the D + E pipeline.
 
-- **Hyperparameter search for post-processing:** threshold from 0.20 to 0.80 (step 0.05) and minimum area from 0 to 8,000 pixels, chosen per class on the validation split.
-- **Is the tuning overfitted?** I tuned on even-numbered validation images and scored on odd ones, and the other way round: 0.7303 and 0.7289. A gap of about 0.001 to 0.002 means the chosen thresholds are not just fitting noise.
-- **Controlled experiments (Milestone 4, 1,200-image subset, 6 epochs, runs R0, R0b, R1, R2 in W&B):** bounded square-root sampling for imbalance, a warmup plus cosine schedule (including the bug of stepping the scheduler per epoch instead of per batch), early stopping, AMP memory, and gradient accumulation.
-- **Memory:** in the Milestone 5 worked example the same tensor needs 8.2 GB in float32, 4.1 GB in float16 and 2.0 GB in uint8. This is why I keep the training images in memory as uint8 and train with AMP.
-- **Inference budget:** the final notebook (two models, 4-flip TTA on 3,000 test images) runs within Kaggle's time and memory limits.
+**Areas for improvement.** An image-level classifier to decide "defect or not" before segmenting; Lovasz or focal loss for the rare classes; 5-fold cross-validation for more stable thresholds; a larger encoder (EfficientNet-B5) or a U-Net++ decoder for ensemble diversity.
 
-## 7. Error analysis
+## 8. References
 
-- **The rare classes are the weak ones.** `defect_a` (216 positives) and `defect_b` (63) have Dice around 0.40 and miss about 37% of their defects (recall 0.63 and 0.62). The common classes `defect_c` and `defect_d` reach Dice 0.64 to 0.75 and recall about 0.90. Model E's higher BCE weight on `defect_b` gave the biggest single gain in the pipeline (+0.017), but `defect_b` is still under-predicted: only 108 test pairs are predicted as `defect_b`, against 1,139 for `defect_c`.
-- **Most false alarms are `defect_c`** (122 of 231). It is the most common class, so the model is biased towards predicting it on textured surfaces.
-- **Small defects vs false alarms.** A minimum-area filter removes noise, but it also deletes real small defects. At N = 100 pixels, 48 true positive pairs in train would be wiped out completely (22 `defect_a`, 24 `defect_c`). This is why the final thresholds keep the minimum areas small (0 to 100 pixels) instead of large.
-- **Failure examples** (validation, below). (1) A large `defect_c` next to a dark band at the edge of the strip is missed completely. The sharp bright/dark edge seems to hide it. (2) A clean image with long scratch-like stripes is predicted as a huge `defect_c` (41,000 pixels). These stripes look like real defects, so it may also be a labelling edge case. (3) The model finds a `defect_d` blob, but in the wrong place (Dice 0.01).
-
-![Failure examples: input, ground truth, prediction](failure_examples.png){width=100%}
-
-- **Validation vs leaderboard gap.** Validation 0.731 vs public LB 0.670. The main reasons are likely: (a) the thresholds are tuned on my own split, (b) the test set may have a different mix of defects, and (c) the public LB uses only part of the test set. The half-split check shows the tuning itself is stable, so the gap is more about distribution shift than overfitting.
-
-## 8. Insights and what I would do next
-
-1. **Pretrained encoders matter most.** Going from scratch to pretrained was the single largest jump.
-2. **Post-processing is worth a lot under this metric.** Because 30% of the score is about empty pairs, per-class thresholds and area filters moved the score as much as a better model.
-3. **Use the official metric everywhere.** The naive Dice would have chosen the wrong threshold.
-4. **Next steps:** a separate image-level classifier to decide "defect or not" before segmenting, Lovasz or focal loss for `defect_b`, 5-fold cross-validation instead of one split for more stable thresholds, and a larger encoder (EfficientNet-B5).
-
-## 9. Reproducibility
-
-- All code is in the Kaggle notebook (GPU T4, internet on) and in the GitHub repo (`scripts/preprocess.py`, `scripts/train.py`, `scripts/inference.py`, `requirements.txt`).
-- Fixed seeds (`SEED` for model D, 7 for model E). The same split is used for every model.
-- Per-class numbers and failure examples come from `reports/final/eval_job/eval_final.py`, run on Kaggle (GPU) with the saved D and E weights. It reproduces the notebook's validation score of 0.7307 exactly.
-- Every training run is logged to the W&B project `23f3001736-t32026` with its config (model, encoder, epochs, LR, loss, augmentation, seed).
+1. O. Ronneberger, P. Fischer, T. Brox. *U-Net: Convolutional Networks for Biomedical Image Segmentation.* MICCAI 2015.
+2. T.-Y. Lin et al. *Feature Pyramid Networks for Object Detection.* CVPR 2017.
+3. K. He, X. Zhang, S. Ren, J. Sun. *Deep Residual Learning for Image Recognition.* CVPR 2016.
+4. M. Tan, Q. Le. *EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks.* ICML 2019.
+5. F. Milletari, N. Navab, S.-A. Ahmadi. *V-Net (soft Dice loss).* 3DV 2016.
+6. I. Loshchilov, F. Hutter. *Decoupled Weight Decay Regularization (AdamW).* ICLR 2019.
+7. L. Smith, N. Topin. *Super-Convergence (one-cycle learning rate).* 2019.
+8. P. Micikevicius et al. *Mixed Precision Training.* ICLR 2018.
+9. P. Iakubovskii. *Segmentation Models PyTorch.* GitHub, 2019. A. Paszke et al. *PyTorch.* NeurIPS 2019. Tools: Weights & Biases, ONNX Runtime, Kaggle.
